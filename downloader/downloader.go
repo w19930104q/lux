@@ -115,6 +115,11 @@ func (downloader *Downloader) writeFile(url string, file *os.File, headers map[s
 	}
 	defer res.Body.Close() // nolint
 
+	// Persist the source validators (ETag / Last-Modified) next to the file
+	// being written, so that a later resume can verify the source is
+	// unchanged before reusing the local bytes.
+	saveResumeMeta(resumeMetaPath(file.Name()), res.Header)
+
 	barWriter := downloader.Bar.NewProxyWriter(file)
 	// Note that io.Copy reads 32kb(maximum) from input and writes them to output, then repeats.
 	// So don't worry about memory.
@@ -142,9 +147,34 @@ func (downloader *Downloader) save(part *extractors.Part, refer, fileName string
 	}
 
 	tempFilePath := filePath + DOWNLOAD_FILE_EXT
-	tempFileSize, _, err := utils.FileSize(tempFilePath)
+	tempFileSize, tempExists, err := utils.FileSize(tempFilePath)
 	if err != nil {
 		return err
+	}
+	if tempExists && part.Size > 0 && tempFileSize >= part.Size {
+		if tempFileSize == part.Size {
+			// The download completed but the temp file was not renamed
+			// (interrupted in between): finish it without re-downloading.
+			os.Remove(resumeMetaPath(tempFilePath)) // nolint
+			return os.Rename(tempFilePath, filePath)
+		}
+		// The temp file is larger than the source: the local bytes are
+		// stale, discard them and re-download from scratch.
+		removeResumeData(tempFilePath)
+		tempFileSize = 0
+	}
+	if tempFileSize > 0 {
+		// Confirm the source is unchanged before reusing the local bytes;
+		// if it changed (or cannot be validated), discard the stale temp
+		// file and re-download from scratch.
+		unchanged, err := downloader.checkSourceUnchanged(part.URL, refer, tempFilePath, tempFileSize)
+		if err != nil {
+			return err
+		}
+		if !unchanged {
+			removeResumeData(tempFilePath)
+			tempFileSize = 0
+		}
 	}
 	headers := map[string]string{
 		"Referer": refer,
@@ -171,7 +201,8 @@ func (downloader *Downloader) save(part *extractors.Part, refer, fileName string
 		// `The process cannot access the file because it is being used by another process.` error.
 		file.Close() // nolint
 		if err == nil {
-			os.Rename(tempFilePath, filePath) // nolint
+			os.Rename(tempFilePath, filePath)       // nolint
+			os.Remove(resumeMetaPath(tempFilePath)) // nolint
 		}
 	}()
 
@@ -259,6 +290,31 @@ func (downloader *Downloader) multiThreadSave(dataPart *extractors.Part, refer, 
 	parts, err := readDirAllFilePart(filePath, fileName, dataPart.Ext)
 	if err != nil {
 		return err
+	}
+
+	if len(parts) > 0 {
+		// Confirm the source is unchanged before reusing the part files,
+		// preferring a part that carries stored validators; if the source
+		// changed (or cannot be validated), discard all stale part files
+		// and re-download from scratch.
+		metaFile := filePartPath(filePath, parts[0])
+		for _, part := range parts {
+			candidate := filePartPath(filePath, part)
+			if meta := loadResumeMeta(resumeMetaPath(candidate)); meta != nil && meta.validator() != "" {
+				metaFile = candidate
+				break
+			}
+		}
+		unchanged, err := downloader.checkSourceUnchanged(dataPart.URL, refer, metaFile, 0)
+		if err != nil {
+			return err
+		}
+		if !unchanged {
+			for _, part := range parts {
+				removeResumeData(filePartPath(filePath, part))
+			}
+			parts = nil
+		}
 	}
 
 	var unfinishedPart []*FilePartMeta
@@ -431,9 +487,21 @@ func readDirAllFilePart(filePath, filename, extname string) ([]*FilePartMeta, er
 	var metas []*FilePartMeta
 	reg := regexp.MustCompile(fmt.Sprintf("%s.%s.part.+", regexp.QuoteMeta(filename), extname))
 	for _, fn := range fns {
+		if strings.HasSuffix(fn.Name(), resumeMetaExt) {
+			// validator sidecar, not a part file
+			continue
+		}
 		if reg.MatchString(fn.Name()) {
-			meta, err := parseFilePartMeta(path.Join(dirPath, fn.Name()), fn.Size())
+			partPath := path.Join(dirPath, fn.Name())
+			meta, err := parseFilePartMeta(partPath, fn.Size())
 			if err != nil {
+				if errors.Cause(err) == errBrokenFilePart {
+					// Broken part file (truncated/corrupted meta header):
+					// remove it; the missing byte range is rebuilt by the
+					// gap-filling logic in multiThreadSave.
+					removeResumeData(partPath)
+					continue
+				}
 				return nil, errors.WithStack(err)
 			}
 			metas = append(metas, meta)
@@ -459,11 +527,11 @@ func parseFilePartMeta(filepath string, fileSize int64) (*FilePartMeta, error) {
 		return nil, errors.WithStack(err)
 	}
 	if readSize < size {
-		return nil, errors.Errorf("the file has been broken, please delete all part files and re-download")
+		return nil, errors.Wrapf(errBrokenFilePart, "the part file %s has been broken", filepath)
 	}
 	err = binary.Read(bytes.NewBuffer(buf[:size]), binary.LittleEndian, meta)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, errors.Wrapf(errBrokenFilePart, "the part file %s has been broken", filepath)
 	}
 	savedSize := fileSize - int64(binary.Size(meta))
 	meta.Cur = meta.Start + savedSize
@@ -483,8 +551,9 @@ func mergeMultiPart(filepath string, parts []*FilePartMeta) error {
 	var partFiles []*os.File
 	defer func() {
 		for _, f := range partFiles {
-			f.Close()           // nolint
-			os.Remove(f.Name()) // nolint
+			f.Close()                           // nolint
+			os.Remove(f.Name())                 // nolint
+			os.Remove(resumeMetaPath(f.Name())) // nolint
 		}
 	}()
 	for _, part := range parts {
